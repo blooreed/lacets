@@ -167,6 +167,7 @@ details.road summary{cursor:pointer;font-weight:600}
 .badge{background:var(--amber);color:var(--amber-ink)}
 .badge.danger{background:#d7263d;color:#fff}
 .limit{width:46px;height:46px;flex:none;border-radius:50%;background:#fff;border:5px solid #d7263d;color:#111;display:grid;place-items:center;font-family:var(--f-hud);font-weight:600;font-size:17px;line-height:1}
+.limit.est{border-style:dashed;border-color:#e88a94}
 .limit.over{animation:blink 1s steps(2) infinite}
 .speed-over{color:var(--bad)}
 @keyframes blink{50%{background:#ffd5d9}}
@@ -532,7 +533,7 @@ function buildConstraints(av, style) {
 async function ignRoute(points, cons) {
   const f = p => `${p[1].toFixed(6)},${p[0].toFixed(6)}`, mid = points.slice(1, -1);
   let u = `https://data.geopf.fr/navigation/itineraire?resource=bdtopo-pgr&profile=car&optimization=fastest&start=${f(points[0])}&end=${f(points[points.length - 1])}`
-    + `&geometryFormat=geojson&getSteps=true&timeUnit=minute&distanceUnit=kilometer&waysAttributes=nature|importance|cpx_classement_administratif|cpx_numero`;
+    + `&geometryFormat=geojson&getSteps=true&timeUnit=minute&distanceUnit=kilometer&waysAttributes=nature|importance|cpx_classement_administratif|cpx_numero|urbain`;
   if (mid.length) u += `&intermediates=${mid.map(f).join("|")}`;
   if (cons.length) u += "&constraints=" + encodeURIComponent(cons.map(c => JSON.stringify(c)).join("|"));
   let r;
@@ -579,6 +580,15 @@ function roadOf(s) {
   const num = (a.cpx_numero || "").trim(), name = (a.nom_1_droite || a.nom_1_gauche || a.cpx_toponyme_route_nommee || "").trim();
   const label = num ? num.replace(/^([A-Z]+)(\d)/, "$1 $2") : (name ? titleCase(name.replace(/\s*\(.*?\)\s*/g, " ").trim()) : "");
   return { id: num || name, label, rp: fold(a.nature).includes("rond-point") };
+}
+/* Limite légale française déduite du type de route (utilisée quand OpenStreetMap ne donne rien) */
+function legalLimit(a) {
+  const n = fold(a.nature), urb = a.urbain === "t" || a.urbain === true || a.urbain === "true", imp = +a.importance || 4;
+  if (n.includes("autoroutier")) return urb ? 90 : 130;
+  if (urb) return 50;
+  if (n.includes("2 chaussees") && imp <= 2) return 110;
+  if (n.includes("bretelle")) return 70;
+  return 80;
 }
 function fromIGN(j) {
   const line = j.geometry.coordinates.map(c => [c[1], c[0]]);
@@ -628,7 +638,9 @@ function fromIGN(j) {
     out.push({ text: mod === "uturn" ? `Fais demi-tour${g.label ? ` sur ${g.label}` : ""}` : `Tourne ${DIRTXT[mod]}${g.label ? ` sur ${g.label}` : ""}`, type: "turn", mod, loc: g.coords[0] });
   }
   out.push({ text: "Retour au point de départ", type: "arrive", mod: "", loc: line[line.length - 1] });
-  return { line, km: j.distance, min, steps: out, mix, dirt, big, small, router: "IGN" };
+  const all = j.portions.flatMap(p => p.steps), vlim = [];
+  all.forEach(s => { const v = legalLimit(s.attributes || {}); (s.geometry?.coordinates || []).forEach(() => vlim.push(v)); });
+  return { line, km: j.distance, min, steps: out, mix, dirt, big, small, vlim: vlim.length === line.length ? vlim : null, router: "IGN" };
 }
 
 /* ---------- Calcul d'itinéraire : OSRM (hors France, sans exclusions) ---------- */
@@ -983,9 +995,10 @@ function loopFrom(c, km) {
   if (!c.steps[0] || c.steps[0].km === undefined) placeSteps(c);
   const total = c.cum[c.cum.length - 1], { p, i } = pointAt(c.line, c.cum, km);
   const line = [p, ...c.line.slice(i + 1), ...c.line.slice(1, i + 1), p];
+  const v = c.vlim, vlim = v ? [v[i], ...v.slice(i + 1), ...v.slice(1, i + 1), v[i]] : null;
   const steps = c.steps.filter(s => s.type !== "depart" && s.type !== "arrive")
     .map(s => ({ ...s, km: s.km >= km ? s.km - km : s.km + total - km })).sort((a, b) => a.km - b.km);
-  return { line, steps, total };
+  return { line, steps, total, vlim };
 }
 async function buildFull(c, home, back) {
   const pr = project(home, c.line, c.cum, 0, c.line.length);
@@ -1010,11 +1023,14 @@ async function buildFull(c, home, back) {
     off += ret.cum[ret.cum.length - 1];
     steps.push({ text: "Arrivée à ton point de départ", type: "arrive", mod: "", loc: home, km: off });
   } else steps.push({ text: "Fin de la boucle", type: "arrive", mod: "", loc: join, km: off });
+  const fill = (r, n) => r?.vlim && r.vlim.length === n ? r.vlim : Array(n).fill(null);
+  const vlim = [...(app ? fill(app, app.line.length) : []), ...fill(loop, loop.line.length), ...(ret ? fill(ret, ret.line.length) : [])];
   const cum = cumul(line), scale = cum[cum.length - 1] / (off || 1);
   steps.forEach(s => { s.km *= scale; });   // recale sur la longueur réelle de la ligne assemblée
   return { ...c, line, cum, steps, km: cum[cum.length - 1], min: c.min + (app?.min || 0) + (ret?.min || 0),
     appKm: app ? app.cum[app.cum.length - 1] : 0, retKm: ret ? ret.cum[ret.cum.length - 1] : 0,
-    appLine: app?.line || null, retLine: ret?.line || null, full: null, fullP: null, fullKey: null, alerts: null, alertsP: null, saved: c.saved };
+    appLine: app?.line || null, retLine: ret?.line || null, vlim: vlim.length === line.length ? vlim : null,
+    full: null, fullP: null, fullKey: null, alerts: null, alertsP: null, alertsInfo: null, osmLim: null, saved: c.saved };
 }
 function fullFor(c) {
   const key = fullKey();
@@ -1066,7 +1082,7 @@ function loadSaved() { try { return JSON.parse(localStorage.getItem(STORE_KEY) |
 function writeSaved(list) { try { localStorage.setItem(STORE_KEY, JSON.stringify(list)); return true; } catch { setStatus("Stockage plein ou bloqué : supprime une sortie enregistrée.", true); return false; } }
 function serialize(c) {
   return { id: c.id, name: c.name, desc: c.desc, style: c.style, router: c.router, km: c.km, min: c.min, turns: c.turns, dplus: c.dplus, altMax: c.altMax, diff: c.diff, mix: c.mix, profile: (c.profile || []).map(Math.round),
-    line: c.line.map(p => [+p[0].toFixed(5), +p[1].toFixed(5)]), steps: c.steps.map(s => ({ text: s.text, type: s.type, mod: s.mod, loc: s.loc.map(v => +v.toFixed(5)), km: s.km })), date: new Date().toISOString() };
+    line: c.line.map(p => [+p[0].toFixed(5), +p[1].toFixed(5)]), vlim: c.vlim || null, steps: c.steps.map(s => ({ text: s.text, type: s.type, mod: s.mod, loc: s.loc.map(v => +v.toFixed(5)), km: s.km })), date: new Date().toISOString() };
 }
 function renderSaved() {
   const list = loadSaved(), ul = $("#saved");
@@ -1111,59 +1127,42 @@ function speak(t, interrupt = true) {
   try { const u = new SpeechSynthesisUtterance(t); u.lang = "fr-FR"; if (interrupt) speechSynthesis.cancel(); speechSynthesis.speak(u); } catch { }
 }
 
-/* ---------- Alertes OpenStreetMap (Overpass) : ralentisseurs, zones de danger, limitations ---------- */
-const OVERPASS = ["https://overpass-api.de/api/interpreter", "https://maps.mail.ru/osm/tools/overpass/api/interpreter", "https://overpass.private.coffee/api/interpreter"];
-async function overpass(q, ms = 25000) {
+/* ---------- Radars, ralentisseurs et limitations ----------
+   Radars fixes : liste officielle du ministère de l'Intérieur (data.gouv.fr), plus OpenStreetMap.
+   Ralentisseurs et limitations : OpenStreetMap (Overpass). Sans info OSM : limite légale déduite de l'IGN.
+   Les radars sont annoncés en « zone de danger », sans position exacte, comme l'impose la loi française. */
+const OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter", "https://maps.mail.ru/osm/tools/overpass/api/interpreter", "https://overpass.osm.jp/api/interpreter"];
+async function overpass(q, ms = 30000) {
   let last;
-  for (const host of OVERPASS) {
-    try {
-      const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
-      const r = await fetch(host, { method: "POST", body: "data=" + encodeURIComponent(q), headers: { "Content-Type": "application/x-www-form-urlencoded" }, signal: ctl.signal });
-      clearTimeout(t);
-      if (!r.ok) { last = new Error(`Overpass ${r.status}`); continue; }
-      return await r.json();
-    } catch (e) { last = e; }
+  for (let round = 0; round < 2; round++) {
+    for (const host of OVERPASS) {
+      try {
+        const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
+        const r = await fetch(host, { method: "POST", body: "data=" + encodeURIComponent(q), headers: { "Content-Type": "application/x-www-form-urlencoded" }, signal: ctl.signal });
+        clearTimeout(t);
+        if (!r.ok) { last = new Error(`Overpass ${r.status}`); continue; }
+        return await r.json();
+      } catch (e) { last = e; }
+    }
+    await sleep(2000);
   }
   throw last || new Error("Overpass indisponible");
 }
+const RADARS_URL = "https://static.data.gouv.fr/resources/liste-des-radars-fixes-en-france/20251230-134204/jeu-de-donnees-liste-des-radars-fixes-en-france-12-2025.csv";
+const RADAR_TYPES = { ETF: "radar fixe", ETD: "radar discriminant", ETFR: "radar feu rouge", ETPN: "radar passage à niveau", ETT: "radar tronçon", ETVM: "radar vitesse moyenne", ETU: "radar urbain", ETM: "radar mobile" };
+let radarsP = null;
+function loadRadars() {
+  if (!radarsP) radarsP = (async () => {
+    const r = await fetch(RADARS_URL);
+    if (!r.ok) throw new Error(`Radars ${r.status}`);
+    const txt = new TextDecoder("iso-8859-1").decode(await r.arrayBuffer());
+    return txt.split(/\r?\n/).slice(1).map(l => l.split(";")).filter(x => x.length >= 6).map(x => ({
+      type: x[1].trim(), vma: parseInt(x[3], 10) || null, p: [parseFloat(x[4]), parseFloat(x[5])]
+    })).filter(x => isFinite(x.p[0]) && isFinite(x.p[1]));
+  })().catch(e => { radarsP = null; throw e; });
+  return radarsP;
+}
 const CALM = { hump: "Dos d'âne", bump: "Ralentisseur", table: "Plateau surélevé", cushion: "Coussin berlinois", chicane: "Chicane", choker: "Rétrécissement", rumble_strip: "Bandes rugueuses", dip: "Cassis", yes: "Ralentisseur" };
-/* Récupère une fois par tracé les ralentisseurs et radars à moins de 20-30 m de la ligne */
-function routeAlerts(c) {
-  if (c.alertsP) return c.alertsP;
-  c.alertsP = (async () => {
-    const rs = resample(c.line, 0.15), found = [];
-    for (let i = 0; i < rs.length; i += 300) {
-      const around = rs.slice(i, i + 301).map(p => `${p[0].toFixed(5)},${p[1].toFixed(5)}`).join(",");
-      const j = await overpass(`[out:json][timeout:25];(node(around:20,${around})[traffic_calming];node(around:30,${around})[highway=speed_camera];);out body;`);
-      found.push(...(j.elements || []));
-    }
-    const out = [];
-    for (const e of found) {
-      const cam = e.tags?.highway === "speed_camera";
-      const pr = project([e.lat, e.lon], c.line, c.cum, 0, c.line.length);
-      if (pr.d > (cam ? 0.05 : 0.03)) continue;
-      const kind = cam ? "zone" : "calm", label = cam ? "Zone de danger" : (CALM[e.tags.traffic_calming] || "Ralentisseur");
-      if (out.some(a => a.kind === kind && Math.abs(a.km - pr.km) < 0.04)) continue;
-      out.push({ kind, label, km: pr.km });
-    }
-    c.alerts = out.sort((a, b) => a.km - b.km);
-    return c.alerts;
-  })().catch(e => { console.warn("Overpass", e); c.alertsP = null; return null; });
-  return c.alertsP;
-}
-function renderAlerts(c) {
-  const el = $("#rAlerts");
-  const show = list => {
-    if (state.current !== c) return;
-    if (!list) { el.textContent = "Ralentisseurs et zones de danger : données OpenStreetMap indisponibles pour le moment."; el.hidden = false; return; }
-    const calm = list.filter(a => a.kind === "calm").length, zone = list.filter(a => a.kind === "zone").length;
-    el.innerHTML = `Sur le parcours : <b>${calm}</b> ralentisseur${calm > 1 ? "s" : ""} et <b>${zone}</b> zone${zone > 1 ? "s" : ""} de danger signalés dans OpenStreetMap.`;
-    el.hidden = false;
-  };
-  if (c.alerts) { show(c.alerts); return; }
-  el.textContent = "Recherche des ralentisseurs et zones de danger…"; el.hidden = false;
-  routeAlerts(c).then(show);
-}
 function parseLimit(v) {
   if (!v) return null;
   const s = String(v).toLowerCase();
@@ -1171,37 +1170,116 @@ function parseLimit(v) {
   const n = parseInt(s, 10); if (!n) return null;
   return s.includes("mph") ? Math.round(n * 1.609) : n;
 }
-/* Limitation de vitesse de la route sous la moto, demandée toutes les 20 s au plus et après 250 m */
-async function refreshLimit(pos, head) {
-  if (nav.limitBusy || Date.now() - nav.limitAt < 20000 || (nav.limitPos && hav(nav.limitPos, pos) < 0.25)) return;
-  nav.limitBusy = true; nav.limitAt = Date.now(); nav.limitPos = pos;
-  try {
-    const j = await overpass(`[out:json][timeout:10];way(around:25,${pos[0].toFixed(5)},${pos[1].toFixed(5)})[highway][maxspeed];out tags geom;`, 12000);
-    let best = null;
-    for (const w of j.elements || []) {
-      const g = (w.geometry || []).map(p => [p.lat, p.lon]); if (g.length < 2) continue;
-      const pr = project(pos, g, cumul(g), 0, g.length);
-      const wb = bearing(g[pr.i], g[pr.i + 1]), align = Math.min(Math.abs(angDiff(wb, head)), Math.abs(angDiff((wb + 180) % 360, head)));
-      const sc = pr.d * 1000 + align;            // proche ET dans le sens de la route
-      if (!best || sc < best.sc) best = { sc, v: parseLimit(w.tags.maxspeed) };
-    }
-    nav.limit = best?.v || null;
-  } catch { /* pas de limitation connue */ }
-  nav.limitBusy = false;
+/* Récupère une fois par tracé : radars officiels, ralentisseurs, radars OSM et limitations OSM */
+function routeAlerts(c) {
+  if (c.alertsP) return c.alertsP;
+  c.alertsP = (async () => {
+    const info = { radars: false, osm: false, limKnown: 0 };
+    const out = [];
+    const add = (kind, label, km, extra = {}) => {
+      if (out.some(a => a.kind === kind && Math.abs(a.km - km) < (kind === "zone" ? 0.15 : 0.04))) return;
+      out.push({ kind, label, km, ...extra });
+    };
+    const lats = c.line.map(p => p[0]), lngs = c.line.map(p => p[1]);
+    const box = [Math.min(...lats) - 0.01, Math.max(...lats) + 0.01, Math.min(...lngs) - 0.01, Math.max(...lngs) + 0.01];
+    // 1. Radars fixes officiels (indépendant d'OpenStreetMap)
+    const radarsJob = loadRadars().then(list => {
+      for (const r of list) {
+        if (r.p[0] < box[0] || r.p[0] > box[1] || r.p[1] < box[2] || r.p[1] > box[3]) continue;
+        const pr = project(r.p, c.line, c.cum, 0, c.line.length);
+        if (pr.d > 0.06) continue;
+        add("zone", "Zone de danger", pr.km, { vma: r.vma, rtype: RADAR_TYPES[r.type] || "radar", official: true });
+      }
+      info.radars = true;
+    }).catch(e => console.warn("Radars", e));
+    // 2. OpenStreetMap : ralentisseurs, radars, limitations des routes empruntées
+    const osmJob = (async () => {
+      const rs = resample(c.line, 0.15), nodes = [], ways = [];
+      for (let i = 0; i < rs.length; i += 250) {
+        const around = rs.slice(i, i + 251).map(p => `${p[0].toFixed(5)},${p[1].toFixed(5)}`).join(",");
+        const j = await overpass(`[out:json][timeout:60];(node(around:20,${around})[traffic_calming];node(around:30,${around})[highway=speed_camera];)->.n;.n out body;way(around:12,${around})[highway][maxspeed];out tags geom;`);
+        for (const e of j.elements || []) (e.type === "way" ? ways : nodes).push(e);
+      }
+      for (const e of nodes) {
+        const cam = e.tags?.highway === "speed_camera";
+        const pr = project([e.lat, e.lon], c.line, c.cum, 0, c.line.length);
+        if (pr.d > (cam ? 0.05 : 0.03)) continue;
+        if (cam) add("zone", "Zone de danger", pr.km, { vma: parseLimit(e.tags.maxspeed), rtype: "radar" });
+        else add("calm", CALM[e.tags.traffic_calming] || "Ralentisseur", pr.km);
+      }
+      // Limitations : pour un point tous les 100 m, la route OSM la plus proche et dans le même sens
+      const W = ways.map(w => { const g = (w.geometry || []).map(p => [p.lat, p.lon]); return { g, cum: g.length > 1 ? cumul(g) : null, v: parseLimit(w.tags.maxspeed) }; }).filter(w => w.cum && w.v);
+      const lim = [], n = Math.max(2, Math.ceil(c.cum[c.cum.length - 1] / 0.1));
+      for (let k = 0; k <= n; k++) {
+        const km = Math.min(c.cum[c.cum.length - 1], k * 0.1), { p, i } = pointAt(c.line, c.cum, km);
+        const head = bearing(c.line[i], c.line[Math.min(i + 1, c.line.length - 1)]);
+        let best = null;
+        for (const w of W) {
+          const pr = project(p, w.g, w.cum, 0, w.g.length);
+          if (pr.d > 0.02) continue;
+          const wb = bearing(w.g[pr.i], w.g[pr.i + 1]), align = Math.min(Math.abs(angDiff(wb, head)), Math.abs(angDiff((wb + 180) % 360, head)));
+          if (align > 35) continue;
+          const sc = pr.d * 1000 + align;
+          if (!best || sc < best.sc) best = { sc, v: w.v };
+        }
+        if (best) lim.push({ km, v: best.v });
+      }
+      c.osmLim = lim;
+      info.limKnown = lim.length / (n + 1);
+      info.osm = true;
+    })().catch(e => console.warn("Overpass", e));
+    await Promise.all([radarsJob, osmJob]);
+    c.alerts = out.sort((a, b) => a.km - b.km);
+    c.alertsInfo = info;
+    return c.alerts;
+  })();
+  return c.alertsP;
+}
+/* Limitation au kilomètre km : OpenStreetMap, sinon vitesse du radar tout proche, sinon règle légale (IGN) */
+function limitAt(c, km, i) {
+  if (c.osmLim?.length) {
+    let lo = 0, hi = c.osmLim.length - 1;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (c.osmLim[m].km < km) lo = m + 1; else hi = m; }
+    for (const j of [lo - 1, lo]) { const e = c.osmLim[j]; if (e && Math.abs(e.km - km) <= 0.12) return { v: e.v, est: false }; }
+  }
+  const z = (c.alerts || []).find(a => a.kind === "zone" && a.vma && Math.abs(a.km - km) < 0.25);
+  if (z) return { v: z.vma, est: false };
+  const v = c.vlim?.[i];
+  return v ? { v, est: true } : null;
+}
+function renderAlerts(c) {
+  const el = $("#rAlerts");
+  const show = list => {
+    if (state.current !== c) return;
+    const info = c.alertsInfo || {};
+    const zone = list.filter(a => a.kind === "zone").length, calm = list.filter(a => a.kind === "calm").length;
+    const parts = [];
+    parts.push(info.radars || info.osm ? `<b>${zone}</b> radar${zone > 1 ? "s" : ""} sur le parcours (annoncé${zone > 1 ? "s" : ""} en zone de danger)` : "Radars : liste officielle indisponible pour le moment");
+    parts.push(info.osm ? `<b>${calm}</b> ralentisseur${calm > 1 ? "s" : ""}` : "ralentisseurs : OpenStreetMap ne répond pas pour le moment");
+    parts.push(info.osm ? `limitations connues sur <b>${Math.round(info.limKnown * 100)} %</b> du trajet, le reste déduit du code de la route` : "limitations déduites du code de la route (agglomération, route, 2×2 voies, autoroute)");
+    el.innerHTML = parts.join(" · ") + ".";
+    el.hidden = false;
+  };
+  if (c.alerts) { show(c.alerts); return; }
+  el.textContent = "Recherche des radars, ralentisseurs et limitations…"; el.hidden = false;
+  routeAlerts(c).then(show);
 }
 function showLimit(speed) {
-  const el = $("#navLimit"), sp = $("#navSpeed");
-  el.hidden = !nav.limit; if (nav.limit) el.textContent = nav.limit;
-  const over = nav.limit && speed != null && speed > nav.limit + 4;
+  const el = $("#navLimit"), sp = $("#navSpeed"), lim = limitAt(nav.route, nav.km, nav.i);
+  nav.limit = lim?.v || null;
+  el.hidden = !lim;
+  if (lim) { el.textContent = lim.v; el.classList.toggle("est", lim.est); el.title = lim.est ? "Limitation probable (règle générale)" : "Vitesse maximale autorisée"; }
+  const over = lim && speed != null && speed > lim.v + 4;
   el.classList.toggle("over", !!over); sp.classList.toggle("speed-over", !!over);
-  if (over && nav.overWarned !== nav.limit) { nav.overWarned = nav.limit; speak(`Attention, vitesse limitée à ${nav.limit}`, false); }
-  if (!over && speed != null && nav.limit && speed < nav.limit) nav.overWarned = null;
+  if (over && !lim.est && nav.overWarned !== lim.v) { nav.overWarned = lim.v; speak(`Attention, vitesse limitée à ${lim.v}`, false); }
+  if (lim && lim.v !== nav.lastLimit) { nav.lastLimit = lim.v; nav.overWarned = null; }
 }
 function updateAlerts() {
   const list = nav.alerts || [], km = nav.km;
   const zone = list.find(a => a.kind === "zone" && a.km - km < 1.5 && a.km - km > -0.3);
   $("#navZone").hidden = !zone;
-  if (zone && !nav.spoken.has("z" + zone.km)) { nav.spoken.add("z" + zone.km); speak("Zone de danger. Respecte les limitations.", false); }
+  if (zone) $("#navZone").textContent = zone.vma ? `Zone de danger · ${zone.vma} km/h` : "Zone de danger";
+  if (zone && !nav.spoken.has("z" + zone.km)) { nav.spoken.add("z" + zone.km); speak(zone.vma ? `Zone de danger. Limitation ${zone.vma}.` : "Zone de danger. Respecte les limitations.", false); }
   const calm = list.find(a => a.kind === "calm" && a.km - km > -0.02 && a.km - km < 0.3);
   const cb = $("#navCalm"); cb.hidden = !calm;
   if (calm) {
@@ -1228,7 +1306,7 @@ async function startNav(simulate) {
   }
   if (!c.steps[0] || c.steps[0].km === undefined) placeSteps(c);
   Object.assign(nav, { active: true, route: c, km: 0, i: 0, first: true, spoken: new Set(), avg: c.km / Math.max(1, c.min) * 60,
-    alerts: c.alerts || [], limit: null, limitAt: 0, limitPos: null, limitBusy: false, overWarned: null, lastFix: null });
+    alerts: c.alerts || [], limit: null, lastLimit: null, overWarned: null, lastFix: null });
   routeAlerts(c).then(a => { if (a && nav.route === c) nav.alerts = a; });
   $("#navZone").hidden = true; $("#navCalm").hidden = true; $("#navLimit").hidden = true;
   $("#app").classList.add("navigating"); $("#nav").hidden = false;
@@ -1293,7 +1371,7 @@ function onPosition(lat, lng, speed) {
   $("#navLeft").textContent = fmtDist(left);
   $("#navEta").textContent = fmtHour(new Date(Date.now() + left / nav.avg * 3600e3));
   $("#navSpeed").textContent = speed != null ? Math.round(speed) : "–";
-  refreshLimit(pos, head); showLimit(speed); updateAlerts();
+  showLimit(speed); updateAlerts();
   const key = c.steps.indexOf(next);
   if (d < 0.4 && d > 0.15 && !nav.spoken.has(key + "a")) { nav.spoken.add(key + "a"); speak(`Dans ${Math.round(d * 10) * 100} mètres, ${next.text.charAt(0).toLowerCase() + next.text.slice(1)}`); }
   if (d <= 0.06 && !nav.spoken.has(key + "b")) { nav.spoken.add(key + "b"); speak(next.text); }
